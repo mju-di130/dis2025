@@ -329,6 +329,11 @@ def main():
     dp_path = save_dataframe(synth_dp, f"synth_synthpop_gaussiancopula_dp_eps{EPSILON_DP}_{get_timestamp_str()}.csv")
 
     # 5) basic summaries and plots
+
+    # ----------------------------------------------------------------------
+    ## 재현 정보 평가 그래프 추가 (Verification Plots)
+    # ----------------------------------------------------------------------
+
     target_col = "최종낙찰금액_num"
     plt.figure(figsize=(8,5))
     sns.histplot(df[target_col].dropna(), bins=30, kde=True, label="orig", color="blue", alpha=0.5)
@@ -338,6 +343,90 @@ def main():
     plt.savefig(plot_path, bbox_inches='tight', dpi=150)
     plt.close()
     logging.info(f"Saved plot: {plot_path}")
+
+    # A. 단변량 분포 비교: 수치형 히스토그램
+    for target_col in ["최종낙찰금액_num", "기초금액_num"]:
+        if target_col in df.columns and target_col in CTGANSynthesized_data.columns:
+            plt.figure(figsize=(8,5))
+            
+            # 💡 분포 시각화를 위해 값의 범위 조정 (Log 또는 표준화 대신, 현실적인 범위로 제한)
+            # 상위 99% 값을 기준으로 최대값을 설정하여 이상치(outlier)의 영향을 줄입니다.
+            if df[target_col].dropna().empty:
+                continue
+
+            vmax = np.percentile(df[target_col].dropna(), 99.5)
+            df_plot = df[target_col].clip(upper=vmax).dropna()
+            synth_plot = CTGANSynthesized_data[target_col].clip(upper=vmax).dropna()
+
+            sns.histplot(df_plot, bins=30, kde=True, label="원본", color="blue", alpha=0.5, stat="density", common_norm=False)
+            sns.histplot(synth_plot, bins=30, kde=True, label="합성", color="orange", alpha=0.5, stat="density", common_norm=False)
+            
+            plt.legend(); plt.title(f"단변량 분포 비교: {target_col.replace('_num', '')} (Max={vmax:.2f})")
+            plot_path = os.path.join(OUTPUT_DIR, f"hist_{target_col}_orig_vs_synth_{get_timestamp_str()}.png")
+            plt.savefig(plot_path, bbox_inches='tight', dpi=150)
+            plt.close()
+            logging.info(f"Saved plot: {plot_path}")
+        else:
+            logging.info(f"Numeric column {target_col} not present for plot.")
+
+    # B. 단변량 분포 비교: 범주형 빈도 막대 그래프
+    target_cat_col = "기관_상위"
+    if target_cat_col in df.columns and target_cat_col in CTGANSynthesized_data.columns:
+        # 데이터프레임 병합 및 출처(source) 컬럼 생성
+        df_orig_freq = df[target_cat_col].value_counts(normalize=True).reset_index()
+        df_orig_freq['Source'] = '원본'
+        df_synth_freq = CTGANSynthesized_data[target_cat_col].value_counts(normalize=True).reset_index()
+        df_synth_freq['Source'] = '합성'
+        
+        # 컬럼 이름 통일 (SDV가 컬럼 이름을 변경하지 않았다고 가정)
+        df_orig_freq.columns = [target_cat_col, 'Frequency', 'Source']
+        df_synth_freq.columns = [target_cat_col, 'Frequency', 'Source']
+        
+        df_combined = pd.concat([df_orig_freq, df_synth_freq])
+
+        plt.figure(figsize=(10, 6))
+        # Seaborn barplot으로 원본과 합성 데이터를 나란히 비교
+        sns.barplot(data=df_combined, x=target_cat_col, y='Frequency', hue='Source')
+        plt.xticks(rotation=45, ha='right')
+        plt.title(f"단변량 분포 비교: 범주형 빈도 ({target_cat_col})")
+        plt.tight_layout()
+        plot_path = os.path.join(OUTPUT_DIR, f"bar_{target_cat_col}_orig_vs_synth_{get_timestamp_str()}.png")
+        plt.savefig(plot_path, bbox_inches='tight', dpi=150)
+        plt.close()
+        logging.info(f"Saved plot: {plot_path}")
+    else:
+        logging.info(f"Categorical column {target_cat_col} not present for plot.")
+
+
+    # C. 이변량 상관관계 비교: 산점도 (Scatter Plot)
+    x_col, y_col = "최종낙찰금액_num", "낙찰율_num"
+    if x_col in df.columns and y_col in df.columns:
+        plt.figure(figsize=(12, 5))
+        
+        # 💡 분포 시각화를 위해 값의 범위 조정 (이상치 제한)
+        x_vmax = np.percentile(df[x_col].dropna(), 99.5)
+        
+        # 원본 데이터 산점도
+        plt.subplot(1, 2, 1)
+        sns.scatterplot(x=df[x_col].clip(upper=x_vmax), y=df[y_col].dropna(), color="blue", alpha=0.6)
+        plt.title(f"원본 데이터: {x_col.replace('_num', '')} vs {y_col.replace('_num', '')}")
+        plt.xlabel(x_col.replace('_num', '')); plt.ylabel(y_col.replace('_num', ''))
+
+        # 합성 데이터 산점도
+        plt.subplot(1, 2, 2)
+        sns.scatterplot(x=CTGANSynthesized_data[x_col].clip(upper=x_vmax), y=CTGANSynthesized_data[y_col].dropna(), color="orange", alpha=0.6)
+        plt.title(f"합성 데이터: {x_col.replace('_num', '')} vs {y_col.replace('_num', '')}")
+        plt.xlabel(x_col.replace('_num', '')); plt.ylabel(y_col.replace('_num', ''))
+        
+        plt.tight_layout()
+        plot_path = os.path.join(OUTPUT_DIR, f"scatter_{x_col}_vs_{y_col}_orig_vs_synth_{get_timestamp_str()}.png")
+        plt.savefig(plot_path, bbox_inches='tight', dpi=150)
+        plt.close()
+        logging.info(f"Saved plot: {plot_path}")
+    else:
+        logging.info(f"Bivariate columns ({x_col}, {y_col}) not present for scatter plot.")
+
+    # ----------------------------------------------------------------------
 
     # Save metadata
     metadata_summary = {
