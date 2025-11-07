@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 
 # Optional: modeling libs
-# 🌟 수정 1: SingleTableMetadata 임포트 로직을 다시 복구하고 load_from_dataframe 사용을 준비합니다.
+# 수정: SingleTableMetadata 임포트 로직을 다시 복구하고 load_from_dataframe 사용을 준비합니다.
 SingleTableMetadata = None
 from sdv.metadata.single_table import SingleTableMetadata
 from sdv.single_table import CTGANSynthesizer, GaussianCopulaSynthesizer
@@ -15,7 +15,7 @@ from sdv.single_table import CTGANSynthesizer, GaussianCopulaSynthesizer
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 🌟 수정 1: 한글 폰트 설정을 위한 모듈 임포트
+# 수정: 한글 폰트 설정을 위한 모듈 임포트
 import matplotlib.font_manager as fm
 import matplotlib as mpl 
 
@@ -196,7 +196,7 @@ def add_laplace_noise_column(values: pd.Series, epsilon: float, sensitivity: flo
 
 # ---------- 시각화 함수 ---------- 
 def make_plots(source_data: pd.DataFrame, synth_data: pd.DataFrame, type: str):
-    # 5) basic summaries and plots
+    # basic summaries and plots
 
     # ----------------------------------------------------------------------
     ## 재현 정보 평가 그래프 추가 (Verification Plots)
@@ -331,12 +331,12 @@ def main():
         logging.error(f"Input file not found: {INPUT_CSV}. Please ensure the file is in the correct directory.")
         return
 
-    # 1. 데이터 로드
+    # 데이터 로드
     logging.info("1. CSV 데이터 로드 시작")
     df_raw = load_data(INPUT_CSV)
     df = preprocess(df_raw)
 
-    # 1) K-익명성 전처리: 기관명 -> 기관_상위
+    # K-익명성 전처리: 기관명 -> 기관_상위
     if "공고기관명" in df.columns:
         df = apply_k_generalization(df, org_col="공고기관명", new_col="기관_상위")
     else:
@@ -354,7 +354,7 @@ def main():
     if ec_sizes.min() < K_TARGET:
         logging.warning(f"Minimum EC size {ec_sizes.min()} < K_TARGET {K_TARGET}. Consider further generalization or suppression.")
 
-    # 2) L-다양성 보정 (민감속성: 연구주제)
+    # L-다양성 보정 (민감속성: 연구주제)
     sensitive_col = "연구주제"
     if sensitive_col not in df.columns:
         logging.warning(f"Sensitive column '{sensitive_col}' missing. Check input data or preprocess function.")
@@ -374,7 +374,7 @@ def main():
 
     # ---------- 재현 정보 생성 ----------
 
-    # 2. 컬럼명 확인 및 날짜 컬럼 변환
+    # 컬럼명 확인 및 날짜 컬럼 변환
     logging.info("컬럼명 확인 및 날짜 타입 변환")
     expected_columns = [
         "입찰공고명", "공고기관명", "최종낙찰금액", "최종낙찰율", "최종낙찰일자",
@@ -384,29 +384,29 @@ def main():
 
     df["최종낙찰일자"] = pd.to_datetime(df["최종낙찰일자"], errors='coerce')
 
-    # 3. SDV 메타데이터 정의 (필수 컬럼 타입 지정)
+    # SDV 메타데이터 정의 (필수 컬럼 타입 지정)
     logging.info("SDV 메타데이터 정의")
     metadata = SingleTableMetadata()
     metadata.detect_from_dataframe(data=df)
 
-    # ----- 1.GaussianCopula -----
+    # ----- GaussianCopula -----
 
     # '최종낙찰일자' 컬럼은 datetime 타입으로 지정
     metadata.update_column("최종낙찰일자", sdtype="datetime")
 
-    # 4. 재현기(GaussianCopulaSynthesizer) 초기화 및 학습
+    # 재현기(GaussianCopulaSynthesizer) 초기화 및 학습
     logging.info("재현기 초기화 및 학습 시작")
     GCsynthesizer = GaussianCopulaSynthesizer(metadata)
 
     GCsynthesizer.fit(df)
 
-    # 5. 재현 정보 생성 (원본과 동일 건수)
+    # 재현 정보 생성 (원본과 동일 건수)
     GCsynthesized_data = GCsynthesizer.sample(num_rows=len(df))
 
-    # 6. 필드별 타입 복원 및 후처리 (필요시)
+    # 필드별 타입 복원 및 후처리 (필요시)
     GCsynthesized_data["최종낙찰일자"] = pd.to_datetime(GCsynthesized_data["최종낙찰일자"])
 
-    # 7. 결과 저장
+    # 결과 저장
     output_path = os.path.join(OUTPUT_DIR, f'synthetic_data_GC_{get_timestamp_str()}.csv')
     GCsynthesized_data.to_csv(output_path, index=False, encoding='utf-8-sig')
 
@@ -415,7 +415,7 @@ def main():
     make_plots(df, GCsynthesized_data, "GC")
 
     # --
-    # 4) DP noise addition to numeric columns (demo)
+    # DP noise addition to numeric columns (demo)
     num_cols = [c for c in GCsynthesized_data.columns if GCsynthesized_data[c].dtype.kind in 'fi']
     logging.info(f"Numeric cols for DP noise demo: {num_cols}")
 
@@ -437,13 +437,13 @@ def main():
 
     CTGANsynthesizer.fit(df)
 
-    # 5. 재현 정보 생성 (원본과 동일 건수)
+    # 재현 정보 생성 (원본과 동일 건수)
     CTGANSynthesized_data = CTGANsynthesizer.sample(num_rows=len(df))
 
-    # 6. 필드별 타입 복원 및 후처리 (필요시)
+    # 필드별 타입 복원 및 후처리 (필요시)
     CTGANSynthesized_data["최종낙찰일자"] = pd.to_datetime(CTGANSynthesized_data["최종낙찰일자"])
 
-    # 7. 결과 저장
+    # 결과 저장
     output_path = os.path.join(OUTPUT_DIR, f'synthetic_data_CTGAN_{get_timestamp_str()}.csv')
     CTGANSynthesized_data.to_csv(output_path, index=False, encoding='utf-8-sig')
 
@@ -452,7 +452,7 @@ def main():
     make_plots(df, CTGANSynthesized_data, "CTGAN")
 
     # --
-    # 4) DP noise addition to numeric columns (demo)
+    # DP noise addition to numeric columns (demo)
     num_cols = [c for c in CTGANSynthesized_data.columns if CTGANSynthesized_data[c].dtype.kind in 'fi']
     logging.info(f"Numeric cols for DP noise demo: {num_cols}")
 
