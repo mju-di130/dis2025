@@ -1,5 +1,6 @@
 import datetime
 import logging
+import json
 import os
 from typing import List, Tuple, Dict
 import pandas as pd
@@ -10,6 +11,43 @@ import numpy as np
 SingleTableMetadata = None
 from sdv.metadata.single_table import SingleTableMetadata
 from sdv.single_table import CTGANSynthesizer, GaussianCopulaSynthesizer
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 🌟 수정 1: 한글 폰트 설정을 위한 모듈 임포트
+import matplotlib.font_manager as fm
+import matplotlib as mpl 
+
+# ---------- 한글 폰트 설정 함수 추가 ----------
+def set_korean_font():
+    """운영체제별 주요 한글 폰트를 찾아 Matplotlib의 기본 폰트로 설정합니다."""
+    # 폰트 경로 목록 (운영체제별 주요 한글 폰트)
+    font_paths = [
+        # Windows
+        'C:/Windows/Fonts/malgun.ttf',
+        # macOS
+        '/System/Library/Fonts/Supplemental/AppleGothic.ttf',
+        '/Library/Fonts/AppleGothic.ttf', # 구 버전 macOS 경로
+        # Linux (Nanum Gothic is common)
+        '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+        '/usr/share/fonts/nanum/NanumGothic.ttf'
+    ]
+    
+    font_name = None
+    for path in font_paths:
+        if os.path.exists(path):
+            font_name = fm.FontProperties(fname=path).get_name()
+            break
+            
+    if font_name:
+        mpl.rc('font', family=font_name)
+        # 마이너스 부호 깨짐 방지
+        mpl.rc('axes', unicode_minus=False)
+        logging.info(f"Matplotlib font set to: {font_name}")
+    else:
+        logging.warning("No standard Korean font found. Korean text in plots may be broken.")
+# -----------------------------------------------
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -131,6 +169,31 @@ def enforce_l_diversity_suppression(df: pd.DataFrame, qi_cols: List[str], sensit
     report_df = pd.DataFrame(report, columns=["equivalence_key", "rows", "unique_sensitive_after"])
     return df, report_df
 
+# ---------- 간단한 DP 노이즈 추가 (데모) ----------
+def add_laplace_noise_column(values: pd.Series, epsilon: float, sensitivity: float=None, clip: Tuple[float,float]=None) -> pd.Series:
+    """
+    Adds Laplace noise with scale = sensitivity/epsilon.
+    """
+
+    vals = values.astype(float).copy().dropna()
+    
+    if len(vals) == 0:
+        return values
+        
+    if clip is not None:
+        vals = vals.clip(clip[0], clip[1])
+        
+    vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+    if sensitivity is None:
+        sensitivity = float(max(1.0, vmax - vmin))
+        
+    scale = sensitivity / float(epsilon)
+    noise = np.random.laplace(loc=0.0, scale=scale, size=len(vals))
+    noisy = vals + noise
+    
+    noisy_series = pd.Series(index=vals.index, data=noisy)
+    return values.combine_first(noisy_series)
+
 # ---------- 요약/저장 함수 ----------
 def save_dataframe(df: pd.DataFrame, fname: str):
     path = os.path.join(OUTPUT_DIR, fname)
@@ -146,6 +209,9 @@ def get_timestamp_str() -> str:
 
 # ---------- 메인 파이프라인 ----------
 def main():
+    # 🌟 수정 4: 메인 함수 시작 시 한글 폰트 설정 함수 호출
+    set_korean_font()
+
     if not os.path.exists(INPUT_CSV):
         logging.error(f"Input file not found: {INPUT_CSV}. Please ensure the file is in the correct directory.")
         return
@@ -246,6 +312,46 @@ def main():
     CTGANSynthesized_data.to_csv(output_path, index=False, encoding='utf-8-sig')
 
     logging.info(f"재현 정보 생성 (CTGANSynthesizer)가 성공적으로 저장되었습니다: {output_path}")
+
+    # --
+    # 4) DP noise addition to numeric columns (demo)
+    num_cols = [c for c in CTGANSynthesized_data.columns if CTGANSynthesized_data[c].dtype.kind in 'fi']
+    logging.info(f"Numeric cols for DP noise demo: {num_cols}")
+
+    synth_dp = CTGANSynthesized_data.copy()
+    for col in num_cols:
+        if col.endswith("_num") or col in ["최종낙찰율_num"]: 
+            col_min, col_max = np.nanmin(synth_dp[col]), np.nanmax(synth_dp[col])
+            sensitivity = float(col_max - col_min) if np.isfinite(col_max) and np.isfinite(col_min) else 1.0
+            logging.info(f"Applying Laplace noise to {col}: sensitivity={sensitivity:.3f}, epsilon={EPSILON_DP}")
+            synth_dp[col] = add_laplace_noise_column(synth_dp[col], epsilon=EPSILON_DP, sensitivity=sensitivity)
+
+    dp_path = save_dataframe(synth_dp, f"synth_synthpop_gaussiancopula_dp_eps{EPSILON_DP}_{get_timestamp_str()}.csv")
+
+    # 5) basic summaries and plots
+    target_col = "최종낙찰금액_num"
+    plt.figure(figsize=(8,5))
+    sns.histplot(df[target_col].dropna(), bins=30, kde=True, label="orig", color="blue", alpha=0.5)
+    sns.histplot(CTGANSynthesized_data[target_col].dropna(), bins=30, kde=True, label="synth", color="orange", alpha=0.5)
+    plt.legend(); plt.title("Final bid amount: original vs synthetic")
+    plot_path = os.path.join(OUTPUT_DIR, f'hist_final_bid_orig_vs_synth_{get_timestamp_str()}.png')
+    plt.savefig(plot_path, bbox_inches='tight', dpi=150)
+    plt.close()
+    logging.info(f"Saved plot: {plot_path}")
+
+    # Save metadata
+    metadata_summary = {
+        "input_file": INPUT_CSV,
+        "rows_original": len(df_raw),
+        "rows_synth": len(CTGANSynthesized_data),
+        "k_target": K_TARGET,
+        "l_target": L_TARGET,
+        "epsilon_dp": EPSILON_DP if True else "N/A (DP not installed)",
+        "sdv_used": True
+    }
+    with open(os.path.join(OUTPUT_DIR, f'synthesis_metadata_{get_timestamp_str()}.json'), "w", encoding="utf-8") as f:
+        json.dump(metadata_summary, f, ensure_ascii=False, indent=2)
+    logging.info("Pipeline finished.")
 
 if __name__ == "__main__":
     main()
