@@ -1,0 +1,9 @@
+{
+  "input_file": "data-utf8.csv",
+  "rows_original": 2486,
+  "rows_synth": 2486,
+  "k_target": 5,
+  "l_target": 3,
+  "epsilon_dp": 0.5,
+  "sdv_used": true
+}
