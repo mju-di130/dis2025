@@ -8,6 +8,21 @@
 # 3. 재현 데이터 생성(Synthetic Data Generation): SDV(Gaussian Copula/CTGAN) 모델 활용
 # 4. 차분 프라이버시(Differential Privacy): 수치형 데이터에 라플라스 노이즈 주입
 # 5. 유용성 평가(Utility Evaluation): 원본 vs 재현 데이터의 통계적 분포 유사성 시각화
+#
+# [출력 설정]
+# - 모든 결과 파일(.csv, .png, .json)은 스크립트가 실행되는 '현재 디렉토리'에 저장된다.
+# - 파일명 및 로그에서 가변적인 시간 정보(Timestamp)를 배제하여 재현성을 확보한다.
+#
+# ----------------------------------------------------------------------------
+# [결과물 요약]
+# 연번 / 구분 / 파일명 / 설명
+# 1. 전처리 데이터 / preprocessed_defense_rnd.csv / 원본 데이터에 전처리(날짜/금액 변환)와 K-익명성(기관명 일반화)이 적용된 데이터
+# 2. L-다양성 보고서 / l_diversity_suppression_report.csv / L-다양성 기준(L=3)을 만족하지 못해 마스킹(Suppression) 처리된 그룹의 정보
+# 3. 재현 데이터 (Raw) / synthetic_data.csv / SDV 모델(Gaussian Copula 등)을 통해 생성된 초기 재현 데이터
+# 4. 재현 데이터 (Final) / synthetic_data_dp_eps0.5.csv / 수치형 변수에 차분 프라이버시(DP) 노이즈(ϵ=0.5)까지 최종 적용된 데이터
+# 5. 메타데이터 / synthesis_metadata.json / 실험에 사용된 파라미터(K,L,ϵ) 및 데이터 건수 요약 정보
+# 6. 이미지 (분포) / hist_최종낙찰금액_num_orig_vs_synth.png / 원본 vs 재현 데이터의 금액 분포 비교 히스토그램
+# 7. 이미지 (상관관계) / scatter_최종낙찰금액_num_vs_낙찰율_num.png / 금액과 낙찰율 간의 상관관계를 보여주는 산점도 비교 그래프
 # =============================================================================
 
 import os
@@ -17,39 +32,33 @@ from typing import List, Tuple, Dict
 
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.font_manager as fm
+import matplotlib as mpl 
 
 # -----------------------------------------------------------------------------
 # [라이브러리 로드] 생성 모델 및 프라이버시 보호 모듈
 # -----------------------------------------------------------------------------
-# 1. SDV (Synthetic Data Vault): 통계적/딥러닝 기반 재현 데이터 생성 라이브러리
-# 2. Diffprivlib: IBM의 차분 프라이버시(DP) 메커니즘 구현 라이브러리
 SingleTableMetadata = None
 try:
     # SDV의 주요 합성 모델(CTGAN, Gaussian Copula) 임포트
     from sdv.single_table import CTGANSynthesizer, GaussianCopulaSynthesizer
     try:
-        # SDV 버전에 따른 메타데이터 모듈 경로 호환성 처리
         from sdv.metadata.single_table import SingleTableMetadata 
     except ImportError:
         from sdv.metadata import SingleTableMetadata
     SDV_AVAILABLE = True
 except Exception as e:
-    logging.error(f"[System] SDV 라이브러리 로드 실패: {e}")
+    # SDV가 설치되지 않은 경우 로깅
     SDV_AVAILABLE = False
 
 try:
     # 차분 프라이버시(Laplace Mechanism) 모듈 임포트
-    from diffprivlib.mechanisms import LaplaceTruncated, Laplace
+    from diffprivlib.mechanisms import Laplace
     DP_AVAILABLE = True
 except Exception:
     DP_AVAILABLE = False
-
-# 시각화 라이브러리 (Matplotlib, Seaborn)
-import matplotlib.pyplot as plt
-import seaborn as sns
-import matplotlib.font_manager as fm
-import matplotlib as mpl 
 
 # -----------------------------------------------------------------------------
 # [환경 설정] 한글 폰트 및 전역 파라미터 정의
@@ -74,13 +83,10 @@ def set_korean_font():
     if font_name:
         mpl.rc('font', family=font_name)
         mpl.rc('axes', unicode_minus=False) # 마이너스(-) 부호 깨짐 방지
-        logging.info(f"[System] Matplotlib 폰트 설정 완료: {font_name}")
-    else:
-        logging.warning("[Warning] 한글 폰트를 찾을 수 없습니다. 그래프 텍스트가 깨질 수 있습니다.")
 
 # [연구 파라미터 설정]
 INPUT_CSV = "data-utf8.csv"  # 원본 방산 데이터 경로
-OUTPUT_DIR = "outputs"       # 결과물 저장 경로
+OUTPUT_DIR = "."             # 결과물 저장 경로 (현재 디렉토리)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # [프라이버시 모델 임계값]
@@ -89,7 +95,8 @@ L_TARGET = 3        # L-다양성 목표값 (민감 속성의 최소 다양성)
 EPSILON_DP = 0.5    # 차분 프라이버시 예산 (epsilon): 작을수록 보호 강도 높음
 SYNTH_ROWS = None   # 생성할 재현 데이터 수 (None일 경우 원본과 동일)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# [로깅 설정] 시간 정보 제거 (Format에서 asctime 제외)
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 # -----------------------------------------------------------------------------
 # [1단계] 데이터 로드 및 전처리 (Preprocessing)
@@ -102,10 +109,7 @@ def load_data(path: str) -> pd.DataFrame:
     return df
 
 def safe_to_numeric(series: pd.Series) -> pd.Series:
-    """
-    문자열로 된 수치 데이터(예: '1,000')를 정수/실수형으로 변환한다.
-    변환 불가능한 값은 결측치(NaN)로 처리하여 분석 오류를 방지한다.
-    """
+    """문자열로 된 수치 데이터(예: '1,000')를 정수/실수형으로 변환한다."""
     s = series.astype(str).str.replace(",", "").str.strip()
     s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan})
     return pd.to_numeric(s, errors='coerce')
@@ -147,13 +151,11 @@ def infer_org_category(org_name: str) -> str:
     """
     [일반화 함수] 구체적인 기관명을 상위 범주(Category)로 매핑한다.
     예: '육군군수사령부' -> '군', '방위사업청' -> '중앙행정기관'
-    이를 통해 준식별자(QI)의 구체성을 낮춰 재식별 위험을 감소시킨다.
     """
     if pd.isna(org_name):
         return "UNKNOWN"
     s = str(org_name)
     
-    # 도메인 지식(Domain Knowledge) 기반의 상위 범주 매핑 규칙
     keywords = {
         "방위사업청": "중앙행정기관", "국방": "중앙행정기관",
         "육군": "군", "해군": "군", "공군": "군",
@@ -164,7 +166,6 @@ def infer_org_category(org_name: str) -> str:
         if k in s:
             return v
             
-    # 규칙에 없는 경우, 문자열 길이를 줄여 일반화 수행
     s_clean = s.replace(" ", "")
     if len(s_clean) > 12:
         return s_clean[:6]
@@ -183,9 +184,7 @@ def apply_k_generalization(df: pd.DataFrame, org_col: str="공고기관명", new
 # [3단계] 비식별화: L-다양성 (Validation & Suppression)
 # -----------------------------------------------------------------------------
 def compute_l_diversity(df: pd.DataFrame, qi_cols: List[str], sensitive_col: str) -> pd.Series:
-    """
-    동질 집합(Equivalence Class) 내 민감 속성의 고유값 개수(L-value)를 계산한다.
-    """
+    """동질 집합(Equivalence Class) 내 민감 속성의 고유값 개수(L-value)를 계산한다."""
     groups = df.groupby(qi_cols)[sensitive_col].nunique()
     return groups
 
@@ -195,15 +194,12 @@ def enforce_l_diversity_suppression(df: pd.DataFrame, qi_cols: List[str], sensit
     해당 집합의 민감 속성 값을 'SUPPRESSED'로 마스킹하여 프라이버시를 보호한다.
     """
     df = df.copy()
-    # L-다양성 검증
     uniq_counts = compute_l_diversity(df, qi_cols, sensitive_col)
-    # 기준 미달 그룹 탐지
     failing_ec = uniq_counts[uniq_counts < L_target].index.tolist()
     report = []
     
     df_copy = df.reset_index(drop=True)
     
-    # 취약 그룹에 대해 마스킹(Suppression) 수행
     for ec_key in failing_ec:
         mask = True
         if isinstance(ec_key, tuple):
@@ -214,9 +210,7 @@ def enforce_l_diversity_suppression(df: pd.DataFrame, qi_cols: List[str], sensit
             
         current_rows = df_copy.loc[mask, :].shape[0]
         current_unique = df_copy.loc[mask, sensitive_col].nunique()
-        
         report.append((str(ec_key), current_rows, current_unique))
-        # 값 억제 적용
         df_copy.loc[mask, sensitive_col] = "SUPPRESSED"
         
     df = df_copy
@@ -224,55 +218,53 @@ def enforce_l_diversity_suppression(df: pd.DataFrame, qi_cols: List[str], sensit
     return df, report_df
 
 # -----------------------------------------------------------------------------
-# [4단계] 재현 데이터 생성 (Synthetic Data Generation via SDV)
+# [4단계] 재현 데이터 생성 (Synthetic Data Generation via SDV) - 수정됨
 # -----------------------------------------------------------------------------
-def synthesize_with_sdv(df: pd.DataFrame, method: str="gaussiancopula", num_rows: int=None, random_state: int=0):
+def synthesize_with_sdv(df: pd.DataFrame, method: str="gaussiancopula", num_rows: int=None):
     """
     SDV 라이브러리를 사용하여 원본 데이터의 통계적 분포를 학습하고 새로운 데이터를 생성한다.
-    - Gaussian Copula: 변수 간의 상관관계(Correlation) 보존에 강점
-    - CTGAN: 범주형 변수의 불균형 및 복잡한 분포 학습에 강점
+    [수정사항] SDV 1.0+ 버전에 맞춰 Metadata 객체 생성을 강제함.
     """
-    global SingleTableMetadata
-
-    if not SDV_AVAILABLE:
+    # SDV 라이브러리 임포트 확인
+    try:
+        from sdv.single_table import CTGANSynthesizer, GaussianCopulaSynthesizer
+        try:
+            from sdv.metadata import SingleTableMetadata
+        except ImportError:
+            from sdv.metadata.single_table import SingleTableMetadata
+    except ImportError:
         raise ImportError("[Error] sdv 패키지가 설치되지 않았습니다.")
         
     df = df.copy()
     if num_rows is None:
         num_rows = len(df)
     
-    # [학습 제외 컬럼 설정]
-    # 이름, 주소 등 직접 식별자(PII)는 모델 학습에서 배제하여 재생성을 원천 차단한다.
+    # [학습 제외 컬럼 설정] 식별자(PII)는 학습에서 배제
     exclude_cols = []
     for c in df.columns:
         if any(keyword in c.lower() for keyword in ["대표자", "담당자", "주소"]):
             exclude_cols.append(c)
     if "공고기관명" in df.columns and "기관_상위" in df.columns:
-        exclude_cols.append("공고기관명") # 일반화된 컬럼만 학습
+        exclude_cols.append("공고기관명") 
         
+    # 모델 학습에 사용할 데이터셋 준비
     cols_for_model = [c for c in df.columns if c not in exclude_cols]
     df_model = df[cols_for_model]
     
-    # 메타데이터 자동 추론
-    metadata_obj = None
-    if SingleTableMetadata:
-        try:
-            metadata_obj = SingleTableMetadata.load_from_dataframe(data=df_model)
-        except Exception as e:
-            logging.error(f"Metadata creation failed: {e}")
-            metadata_obj = None 
+    # [핵심 수정] 메타데이터 자동 추론 (필수)
+    # SDV 1.0 이상에서는 Synthesizer 초기화 시 metadata가 반드시 필요함
+    logging.info("[Metadata] 데이터로부터 메타데이터 자동 추론 중...")
+    metadata = SingleTableMetadata()
+    metadata.detect_from_dataframe(data=df_model)
     
     # 모델 초기화 및 학습
+    model = None
     if method.lower() == "ctgan":
-        if metadata_obj:
-            model = CTGANSynthesizer(metadata=metadata_obj, epochs=300, cuda=False)
-        else:
-            model = CTGANSynthesizer(epochs=300, cuda=False)
+        logging.info("[Model] CTGAN 모델 초기화")
+        model = CTGANSynthesizer(metadata=metadata, epochs=300, cuda=False)
     else: # Default: Gaussian Copula
-        if metadata_obj:
-            model = GaussianCopulaSynthesizer(metadata=metadata_obj) 
-        else:
-            model = GaussianCopulaSynthesizer()
+        logging.info("[Model] Gaussian Copula 모델 초기화")
+        model = GaussianCopulaSynthesizer(metadata=metadata) 
         
     logging.info(f"[Training] 모델 학습 시작 ({method})")
     model.fit(df_model)
@@ -281,7 +273,7 @@ def synthesize_with_sdv(df: pd.DataFrame, method: str="gaussiancopula", num_rows
     logging.info(f"[Sampling] {num_rows}건 생성 중...")
     synth = model.sample(num_rows)
     
-    # 제외된 컬럼은 결측치(NaN)로 채워 구조 유지
+    # 제외된 컬럼은 결측치(NaN)로 채움 (구조 유지를 위해)
     for c in exclude_cols:
         synth[c] = np.nan
         
@@ -293,7 +285,6 @@ def synthesize_with_sdv(df: pd.DataFrame, method: str="gaussiancopula", num_rows
 def add_laplace_noise_column(values: pd.Series, epsilon: float, sensitivity: float=None, clip: Tuple[float,float]=None) -> pd.Series:
     """
     수치형 데이터에 라플라스 노이즈(Laplace Noise)를 주입하여 epsilon-DP를 만족시킨다.
-    Noise ~ Laplace(0, Sensitivity / epsilon)
     """
     if not DP_AVAILABLE:
         logging.error("diffprivlib 미설치로 DP 적용 불가")
@@ -306,12 +297,12 @@ def add_laplace_noise_column(values: pd.Series, epsilon: float, sensitivity: flo
     if clip is not None:
         vals = vals.clip(clip[0], clip[1])
         
-    # 민감도(Sensitivity) 산출: 데이터의 변동 가능 범위
+    # 민감도(Sensitivity) 산출
     vmin, vmax = np.nanmin(vals), np.nanmax(vals)
     if sensitivity is None:
         sensitivity = float(max(1.0, vmax - vmin))
         
-    # 노이즈 스케일 계산 및 주입
+    # 노이즈 주입
     scale = sensitivity / float(epsilon)
     noise = np.random.laplace(loc=0.0, scale=scale, size=len(vals))
     noisy = vals + noise
@@ -320,7 +311,7 @@ def add_laplace_noise_column(values: pd.Series, epsilon: float, sensitivity: flo
     return values.combine_first(noisy_series)
 
 # -----------------------------------------------------------------------------
-# [메인 실행 함수]
+# [유틸리티] 결과 저장 함수
 # -----------------------------------------------------------------------------
 def save_dataframe(df: pd.DataFrame, fname: str):
     path = os.path.join(OUTPUT_DIR, fname)
@@ -328,6 +319,9 @@ def save_dataframe(df: pd.DataFrame, fname: str):
     logging.info(f"Saved: {path}")
     return path
 
+# -----------------------------------------------------------------------------
+# [메인 실행 함수]
+# -----------------------------------------------------------------------------
 def main():
     """전체 파이프라인 실행 제어"""
     set_korean_font()
@@ -340,19 +334,18 @@ def main():
     df_raw = load_data(INPUT_CSV)
     df = preprocess(df_raw)
 
-    # 2. K-익명성 적용 (일반화)
+    # 2. K-익명성 적용
     if "공고기관명" in df.columns:
         df = apply_k_generalization(df, org_col="공고기관명", new_col="기관_상위")
     else:
         df["기관_상위"] = "UNKNOWN"
 
-    # 준식별자(QI) 정의
     qi_cols = ["기관_상위"]
     if "개찰일자" in df.columns:
         df["연도"] = df["개찰일자"].dt.year.fillna(-1).astype(int)
         qi_cols.append("연도")
         
-    # 3. L-다양성 검증 및 적용
+    # 3. L-다양성 검증
     sensitive_col = "연구주제"
     if sensitive_col in df.columns:
         df[sensitive_col] = df[sensitive_col].astype(str).fillna("NA") 
@@ -365,14 +358,15 @@ def main():
 
     save_dataframe(df, "preprocessed_defense_rnd.csv")
 
-    # 4. 재현 데이터 생성 (SDV)
+    # 4. 재현 데이터 생성 및 DP 적용
     if SDV_AVAILABLE:
         rows = SYNTH_ROWS if SYNTH_ROWS is not None else len(df)
         try:
+            # 4-1. 합성 데이터 생성
             synth_df = synthesize_with_sdv(df, method="gaussiancopula", num_rows=rows)
             save_dataframe(synth_df, "synthetic_data.csv")
             
-            # 5. DP 노이즈 적용 (수치형 변수)
+            # 4-2. DP 노이즈 적용 (수치형 변수)
             num_cols = [c for c in synth_df.columns if synth_df[c].dtype.kind in 'fi']
             synth_dp = synth_df.copy()
             if DP_AVAILABLE:
@@ -383,8 +377,48 @@ def main():
                         synth_dp[col] = add_laplace_noise_column(synth_df[col], epsilon=EPSILON_DP, sensitivity=sensitivity)
                 save_dataframe(synth_dp, f"synthetic_data_dp_eps{EPSILON_DP}.csv")
                 
-                # 6. 유용성 평가 (시각화)
-                # (히스토그램 및 산점도 생성 코드는 생략 - 필요 시 위 코드 참조)
+                # 5. 유용성 평가 시각화 (이미지 저장)
+                # (1) 단변량 분포 (히스토그램)
+                for target_col in ["최종낙찰금액_num", "기초금액_num"]:
+                    if target_col in df.columns and target_col in synth_dp.columns:
+                        plt.figure(figsize=(8,5))
+                        vmax = np.percentile(df[target_col].dropna(), 99.5) # 이상치 제외
+                        
+                        sns.histplot(df[target_col].clip(upper=vmax).dropna(), bins=30, kde=True, label="원본", color="blue", alpha=0.5, stat="density", common_norm=False)
+                        sns.histplot(synth_dp[target_col].clip(upper=vmax).dropna(), bins=30, kde=True, label="재현(DP)", color="orange", alpha=0.5, stat="density", common_norm=False)
+                        
+                        plt.legend()
+                        plt.title(f"분포 비교: {target_col.replace('_num', '')} (Max={vmax:.0f})")
+                        plt.savefig(os.path.join(OUTPUT_DIR, f"hist_{target_col}_orig_vs_synth.png"), bbox_inches='tight', dpi=150)
+                        plt.close()
+
+                # (2) 이변량 상관관계 (산점도)
+                x_col, y_col = "최종낙찰금액_num", "낙찰율_num"
+                if x_col in df.columns and y_col in df.columns:
+                    plt.figure(figsize=(12, 5))
+                    x_vmax = np.percentile(df[x_col].dropna(), 99.5)
+                    
+                    plt.subplot(1, 2, 1)
+                    sns.scatterplot(x=df[x_col].clip(upper=x_vmax), y=df[y_col].dropna(), color="blue", alpha=0.6)
+                    plt.title("원본 데이터 분포")
+                    
+                    plt.subplot(1, 2, 2)
+                    sns.scatterplot(x=synth_dp[x_col].clip(upper=x_vmax), y=synth_dp[y_col].dropna(), color="orange", alpha=0.6)
+                    plt.title("재현 데이터(DP) 분포")
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(OUTPUT_DIR, f"scatter_{x_col}_vs_{y_col}.png"), bbox_inches='tight', dpi=150)
+                    plt.close()
+                
+                # 6. 메타데이터 저장
+                metadata_summary = {
+                    "input_file": INPUT_CSV, "rows_original": len(df),
+                    "rows_synth": len(synth_dp), "k_target": K_TARGET,
+                    "l_target": L_TARGET, "epsilon_dp": EPSILON_DP
+                }
+                with open(os.path.join(OUTPUT_DIR, "synthesis_metadata.json"), "w", encoding="utf-8") as f:
+                    json.dump(metadata_summary, f, ensure_ascii=False, indent=2)
+
                 logging.info("[Completed] 모든 프로세스가 성공적으로 완료되었습니다.")
                 
         except Exception as e:
