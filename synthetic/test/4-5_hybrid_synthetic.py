@@ -10,6 +10,14 @@
 # 수정사항: 
 # 1. [Critical Fix] 학습 데이터(Label) 내 NaN/Infinity 전처리 로직 강화
 # 2. XGBoost 'Label contains NaN' 오류 원천 차단
+#
+# 수정사항: 
+# 1. AI 성능 보존율(Retention Rate) 시각화 함수 추가
+# 2. 결과 데이터프레임에 보존율(%) 컬럼 자동 계산 포함
+#
+# 수정사항: 
+# 1. 최종 평가 결과(Summary)를 CSV 파일로 저장하는 기능 추가
+# 2. 모든 에러 방지 로직(NaN 처리, 컬럼명 통일) 포함
 # =============================================================================
 
 import pandas as pd
@@ -43,6 +51,7 @@ warnings.filterwarnings("ignore")
 # [설정]
 INPUT_CSV = "data.csv"
 OUTPUT_SYNTHETIC = "synthetic_data_hybrid.csv"
+OUTPUT_SUMMARY = "final_evaluation_summary.csv" # 결과 저장 파일명
 EPSILON_DP = 0.5
 
 # 한글 폰트 설정
@@ -62,7 +71,6 @@ def set_korean_font():
 # [1단계] 데이터 로드 및 전처리
 # -----------------------------------------------------------------------------
 def load_and_preprocess():
-    # 1. 데이터 로드
     if not os.path.exists(INPUT_CSV):
         raise FileNotFoundError(f"파일이 없습니다: {INPUT_CSV}")
         
@@ -71,17 +79,14 @@ def load_and_preprocess():
     except:
         df = pd.read_csv(INPUT_CSV, encoding='cp949')
     
-    # 컬럼명 공백 제거
     df.columns = df.columns.str.strip()
     print(f"[System] 데이터 로드: {len(df)}건")
 
-    # 2. 날짜 데이터 처리
     if '최종낙찰일자' in df.columns:
         df['최종낙찰일자'] = pd.to_datetime(df['최종낙찰일자'], errors='coerce')
         df['최종낙찰일자_year'] = df['최종낙찰일자'].dt.year
         df['최종낙찰일자_month'] = df['최종낙찰일자'].dt.month
 
-    # 3. 수치형 변환
     def clean(x):
         try: return float(str(x).replace(',', ''))
         except: return np.nan
@@ -89,14 +94,11 @@ def load_and_preprocess():
     for c in ['최종낙찰금액', '최종낙찰율', '기초금액']:
         if c in df.columns: df[c] = df[c].apply(clean)
 
-    # 4. 기초금액 역산 (결측치 채우기)
     if '기초금액' not in df.columns or df['기초금액'].isnull().mean() > 0.5:
         if '최종낙찰금액' in df.columns and '최종낙찰율' in df.columns:
-            # 0으로 나누기 방지
             rate = df['최종낙찰율'].replace(0, np.nan)
             df['기초금액'] = df['최종낙찰금액'] / (rate / 100)
     
-    # 5. 기관명 범주화
     if '공고기관명' in df.columns:
         def cat_agency(x):
             s = str(x)
@@ -107,19 +109,13 @@ def load_and_preprocess():
     else:
         df['기관_상위'] = '기타'
 
-    # 6. 로그 변환 (학습용)
     if '최종낙찰금액' in df.columns:
         df['최종낙찰금액_log'] = np.log1p(df['최종낙찰금액'].clip(lower=0))
     
-    # ★ [핵심 수정] 결측치(NaN) 및 무한대(Inf) 제거 (학습 오류 방지)
-    # 주요 변수에 NaN이 있으면 머신러닝 학습 시 'Label contains NaN' 에러 발생
     important_cols = ['최종낙찰금액', '최종낙찰율', '기초금액', '기관_상위']
     important_cols = [c for c in important_cols if c in df.columns]
-    
-    # Inf -> NaN 변환 후 Drop
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=important_cols)
     
-    print(f"[Preprocessing] 결측치 제거 후 데이터: {len(df)}건")
     return df
 
 # -----------------------------------------------------------------------------
@@ -128,34 +124,26 @@ def load_and_preprocess():
 def generate_hybrid(df):
     print("\n[Generation] 하이브리드 재현 데이터 생성 시작...")
     
-    # 학습 컬럼 선정
     candidates = ['최종낙찰금액_log', '최종낙찰율', '기관_상위', '최종낙찰일자_year', '최종낙찰일자_month']
     train_cols = [c for c in candidates if c in df.columns]
-    
     df_train = df[train_cols].dropna()
     
-    # 모델 학습 (속도를 위해 Epochs=300 설정, 실제 실험용은 500 권장)
     metadata = SingleTableMetadata()
     metadata.detect_from_dataframe(df_train)
     
+    # 모델 학습 (속도를 위해 Epochs=300 설정, 실제 실험용은 500 권장)
     model = CTGANSynthesizer(metadata, epochs=500, verbose=True)
     model.fit(df_train)
     
-    # 샘플링
     synth = model.sample(len(df))
     
-    # [복원 1] 로그 역변환
     if '최종낙찰금액_log' in synth.columns:
         synth['최종낙찰금액'] = np.expm1(synth['최종낙찰금액_log']).clip(lower=0)
     
-    # [복원 2] 기초금액 수식 계산
     if '최종낙찰금액' in synth.columns and '최종낙찰율' in synth.columns:
         print("[Post-processing] 수식 기반 '기초금액' 복원 중...")
-        # 0으로 나누기 방지
         rate = synth['최종낙찰율'].replace(0, 0.1) 
         synth['기초금액'] = synth['최종낙찰금액'] / (rate / 100)
-        
-        # 무한대 및 NaN 처리 (매우 중요)
         synth['기초금액'] = synth['기초금액'].replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0)
     
     return synth
@@ -174,20 +162,12 @@ def evaluate_tstr(real, synth):
     for target in targets:
         if target not in real.columns or target not in synth.columns: continue
         
-        print(f">> 타겟 분석 중: {target}")
-        
-        # ★ [핵심 수정] 타겟 변수 결측치 재확인 및 제거 (2중 안전장치)
-        # NaN이 하나라도 있으면 XGBoost가 멈춤
         real_clean = real.dropna(subset=[target])
         synth_clean = synth.dropna(subset=[target])
         
-        if len(real_clean) == 0 or len(synth_clean) == 0:
-            print(f"   [Skip] {target} 데이터가 비어있어 평가를 건너뜁니다.")
-            continue
+        if len(real_clean) == 0 or len(synth_clean) == 0: continue
 
-        # 데이터 준비
         drop_cols = [target] + [c for c in real.columns if 'log' in c or '공고' in c or '일자' in c]
-        
         X_real = real_clean.drop(columns=drop_cols, errors='ignore').select_dtypes(include=[np.number])
         y_real = real_clean[target]
         X_synth = synth_clean.drop(columns=drop_cols, errors='ignore').select_dtypes(include=[np.number])
@@ -195,45 +175,31 @@ def evaluate_tstr(real, synth):
         
         if X_real.shape[1] == 0: continue
 
-        # Target 인코딩 (분류)
         is_classification = False
         if y_real.dtype == 'object' or y_real.nunique() < 20:
             is_classification = True
             le = LabelEncoder()
-            # 학습 데이터(Synth) 기준으로 인코딩
             y_synth = le.fit_transform(y_synth.astype(str))
-            
-            # 테스트 데이터(Real)는 학습 데이터에 있는 클래스만 남김
             mask = y_real.astype(str).isin(le.classes_)
-            if mask.sum() == 0: continue # 매칭되는 클래스 없음
-            
+            if mask.sum() == 0: continue 
             X_real = X_real[mask]
             y_real = le.transform(y_real[mask].astype(str))
-            
             model = XGBClassifier(n_jobs=-1, random_state=42)
             metric = "F1-Score"
         else:
-            # 회귀 (무한대 값 체크)
-            if not np.isfinite(y_real).all() or not np.isfinite(y_synth).all():
-                print("   [Skip] Target 변수에 무한대(Inf) 값이 포함되어 있습니다.")
-                continue
-                
+            if not np.isfinite(y_real).all() or not np.isfinite(y_synth).all(): continue
             model = XGBRegressor(n_jobs=-1, random_state=42)
             metric = "R2 Score"
             
-        # 데이터 분할
         try:
             X_train, X_test, y_train, y_test = train_test_split(X_real, y_real, test_size=0.2, random_state=42)
             
-            # 1. TRTR
             model.fit(X_train, y_train)
             pred_trtr = model.predict(X_test)
             
-            # 2. TSTR
             model.fit(X_synth, y_synth)
             pred_tstr = model.predict(X_test)
             
-            # 점수
             if is_classification:
                 s_trtr = f1_score(y_test, pred_trtr, average='macro')
                 s_tstr = f1_score(y_test, pred_tstr, average='macro')
@@ -241,44 +207,55 @@ def evaluate_tstr(real, synth):
                 s_trtr = r2_score(y_test, pred_trtr)
                 s_tstr = r2_score(y_test, pred_tstr)
                 
-            print(f"   - TRTR: {s_trtr:.4f} / TSTR: {s_tstr:.4f}")
-            results.append({'Target': target, 'TRTR': s_trtr, 'TSTR': s_tstr})
+            retention = (s_tstr / s_trtr) * 100 if s_trtr > 0 else 0
+            
+            print(f" >> 타겟: {target} | TRTR: {s_trtr:.4f} | TSTR: {s_tstr:.4f} | 보존율: {retention:.1f}%")
+            results.append({'Target': target, 'Metric': metric, 'TRTR': s_trtr, 'TSTR': s_tstr, 'Retention(%)': retention})
             
         except Exception as e:
-            print(f"   [Error] 모델 학습 중 오류: {e}")
+            print(f"   [Error] {target} 학습 오류: {e}")
 
     return pd.DataFrame(results)
 
 # -----------------------------------------------------------------------------
 # [4단계] 시각화
 # -----------------------------------------------------------------------------
-def plot_correlation(real, synth):
-    if '기초금액' not in real.columns or '최종낙찰금액' not in real.columns: return
-
-    # 시각화 전 결측 제거
-    real = real.replace([np.inf, -np.inf], np.nan).dropna(subset=['기초금액', '최종낙찰금액'])
-    synth = synth.replace([np.inf, -np.inf], np.nan).dropna(subset=['기초금액', '최종낙찰금액'])
-
-    plt.figure(figsize=(12, 5))
-    n = min(1000, len(real))
-    
-    plt.subplot(1, 2, 1)
-    if len(real) > 0:
+def plot_results(real, synth, res_df):
+    if '기초금액' in real.columns and '최종낙찰금액' in real.columns:
+        plt.figure(figsize=(12, 5))
+        n = min(1000, len(real))
+        
+        plt.subplot(1, 2, 1)
         samp = real.sample(n)
         sns.scatterplot(x=samp['기초금액'], y=samp['최종낙찰금액'], alpha=0.5)
-        corr = samp[['기초금액','최종낙찰금액']].corr().iloc[0,1]
-        plt.title(f"원본 데이터 (Corr={corr:.4f})")
-    
-    plt.subplot(1, 2, 2)
-    if len(synth) > 0:
+        plt.title("원본 데이터 (Ground Truth)")
+        
+        plt.subplot(1, 2, 2)
         samp = synth.sample(n)
         sns.scatterplot(x=samp['기초금액'], y=samp['최종낙찰금액'], color='orange', alpha=0.5)
-        corr = samp[['기초금액','최종낙찰금액']].corr().iloc[0,1]
-        plt.title(f"재현 데이터 (Corr={corr:.4f})")
-    
-    plt.tight_layout()
-    plt.savefig("Hybrid_Scatter_Final.png")
-    print("\n[Visualization] 산점도 그래프 저장 완료: Hybrid_Scatter_Final.png")
+        plt.title("하이브리드 재현 데이터 (Hybrid Synthetic)")
+        
+        plt.tight_layout()
+        plt.savefig("Hybrid_Scatter_Final.png")
+        print("\n[Visualization] 산점도 저장 완료: Hybrid_Scatter_Final.png")
+
+    if not res_df.empty:
+        plt.figure(figsize=(10, 6))
+        colors = ['green' if x >= 90 else '#1f77b4' for x in res_df['Retention(%)']]
+        ax = sns.barplot(data=res_df, x='Target', y='Retention(%)', palette=colors)
+        plt.axhline(100, color='red', linestyle='--', label='Ideal (100%)')
+        
+        for p in ax.patches:
+            height = p.get_height()
+            ax.annotate(f'{height:.1f}%', (p.get_x() + p.get_width() / 2., height),
+                        ha='center', va='bottom', fontsize=12, fontweight='bold')
+            
+        plt.title("Hybrid 재현 데이터 AI 성능 보존율 (Retention Rate)", fontsize=15)
+        plt.ylabel("보존율 (%)", fontsize=12)
+        plt.ylim(0, max(120, res_df['Retention(%)'].max() + 10))
+        plt.legend()
+        plt.savefig("Hybrid_Retention_Rate.png")
+        print("[Visualization] 보존율 그래프 저장 완료: Hybrid_Retention_Rate.png")
 
 # -----------------------------------------------------------------------------
 # [Main]
@@ -299,10 +276,13 @@ if __name__ == "__main__":
         res_df = evaluate_tstr(df_real, df_synth)
         
         # 4. 시각화
-        plot_correlation(df_real, df_synth)
+        plot_results(df_real, df_synth, res_df)
         
+        # 5. [추가] 결과 요약 CSV 저장
         print("\n[Final Summary]")
         print(res_df)
+        res_df.to_csv(OUTPUT_SUMMARY, index=False, encoding='utf-8-sig')
+        print(f"[System] 평가 결과 저장 완료: {OUTPUT_SUMMARY}")
         
     except Exception as e:
         print(f"[Critical Error] {e}")
