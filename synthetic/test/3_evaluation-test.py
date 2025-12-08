@@ -19,11 +19,11 @@
 # - xgboost: 고성능 그라디언트 부스팅 모델 (TSTR 평가용)
 # - sdv, scikit-learn: 데이터 처리 및 평가 지표 산출용
 # - matplotlib, seaborn: 결과 시각화용
-try:
-    import xgboost
-    import sdv
-except ImportError:
-    !pip install xgboost scikit-learn pandas numpy matplotlib seaborn sdv
+#try:
+#    import xgboost
+#    import sdv
+#except ImportError:
+#    !pip install xgboost scikit-learn pandas numpy matplotlib seaborn sdv
 
 import pandas as pd
 import numpy as np
