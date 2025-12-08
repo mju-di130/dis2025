@@ -8,6 +8,10 @@
 # 2. 롱테일(Long-tail) 분포 시각화: '최종낙찰금액'의 원본 vs 재현 데이터 비교
 # 3. 상관관계(Correlation) 분석: 변수 간(기초금액-낙찰금액) 선형 관계 유지 여부 (Heatmap)
 # 4. 범주형 분포(Frequency): '기관_상위' 변수의 비율 보존 여부 확인
+#
+# [수정 사항]
+# - '기초금액' 컬럼 부재 시, 낙찰금액과 낙찰율을 이용해 강제 역산(Derivation)하는 로직 추가
+# - 시각화 단계에서 데이터 부족 경고(Skip)를 방지하고 그래프 생성을 보장함
 # =============================================================================
 
 import os
@@ -102,21 +106,42 @@ def infer_org_category(org_name: str) -> str:
 
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # 날짜 변환
+    
+    # 1. 날짜 변환
     for col in ["개찰일자", "최종낙찰일자"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
             
-    # 수치 변환 (컬럼 존재 여부 확인 후 변환)
-    numeric_targets = ["기초금액", "최종낙찰금액", "최종낙찰율"]
-    for col in numeric_targets:
+    # 2. 수치 변환 (콤마 제거 및 숫자화)
+    # 분석에 필요한 핵심 컬럼들을 우선 변환합니다.
+    target_nums = ["최종낙찰금액", "최종낙찰율", "기초금액"]
+    for col in target_nums:
         if col in df.columns:
-            target_col = col + "_num" if col != "최종낙찰율" else "낙찰율_num"
-            df[target_col] = safe_to_numeric(df[col])
+            df[col] = safe_to_numeric(df[col])
+
+    # 3. [핵심 수정] 기초금액 데이터 복원 (역산 로직)
+    # 기초금액 컬럼이 없거나 비어있는 경우: 기초금액 = 낙찰금액 / (낙찰율 / 100)
+    if "기초금액" not in df.columns or df["기초금액"].isnull().all():
+        if "최종낙찰금액" in df.columns and "최종낙찰율" in df.columns:
+            logging.info(">>> [Preprocessing] '기초금액' 컬럼 부재로 역산(Derivation)하여 생성합니다.")
+            # 0으로 나누기 방지
+            rate = df["최종낙찰율"].replace(0, np.nan)
+            df["기초금액"] = df["최종낙찰금액"] / (rate / 100)
+            
+            # 무한대값이나 불가능한 값 처리
+            df["기초금액"] = df["기초금액"].replace([np.inf, -np.inf], np.nan)
+            
+            # 컬럼 이름 통일 (분석 코드와의 호환성을 위해)
+            # 분석 코드에서는 '낙찰율'이라는 이름을 사용할 수 있으므로 별칭 생성
+            df["낙찰율"] = df["최종낙찰율"]
         else:
-            logging.warning(f"데이터셋에 '{col}' 컬럼이 없습니다. 해당 분석이 건너뛰어질 수 있습니다.")
-    
-    # [K-익명성] 기관명 일반화 (기관_상위)
+            logging.warning(">>> [Critical Warning] 기초금액을 복원할 수 없습니다. (낙찰금액/낙찰율 데이터 부족)")
+    else:
+        # 기초금액이 있지만 분석 코드 편의를 위해 낙찰율 별칭 생성
+        if "최종낙찰율" in df.columns:
+            df["낙찰율"] = df["최종낙찰율"]
+
+    # 4. [K-익명성] 기관명 일반화 (기관_상위)
     if "공고기관명" in df.columns:
         df["기관_상위"] = df["공고기관명"].apply(infer_org_category)
     else:
@@ -133,7 +158,8 @@ def generate_synthetic_data(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy() 
 
     # 학습용 컬럼 선택 (존재하는 컬럼만 동적으로 선택)
-    potential_cols = ["기초금액_num", "최종낙찰금액_num", "낙찰율_num", "기관_상위"]
+    # [수정] 전처리에서 생성된 '기초금액', '낙찰율'을 포함
+    potential_cols = ["기초금액", "최종낙찰금액", "낙찰율", "기관_상위"]
     train_cols = [c for c in potential_cols if c in df.columns]
     
     if not train_cols:
@@ -198,7 +224,7 @@ def analyze_statistical_similarity(real: pd.DataFrame, synth: pd.DataFrame):
     # 1. 정량적 지표: JSD (Jensen-Shannon Divergence)
     print("\n[1] 정량적 지표 분석 (JSD)")
     jsd_results = {}
-    check_cols = ["최종낙찰금액_num", "낙찰율_num", "기초금액_num"]
+    check_cols = ["최종낙찰금액", "낙찰율", "기초금액"]
     
     for col in check_cols:
         if col in real.columns and col in synth.columns:
@@ -207,56 +233,62 @@ def analyze_statistical_similarity(real: pd.DataFrame, synth: pd.DataFrame):
             if len(r_data) > 0 and len(s_data) > 0:
                 jsd = calculate_jsd(r_data, s_data)
                 jsd_results[col] = jsd
-                print(f" - {col.replace('_num', '')} JSD: {jsd:.4f} (논문 목표: < 0.1)")
-            else:
-                print(f" - {col} 데이터가 비어있어 JSD 계산 불가")
-        else:
-            # 컬럼이 없을 경우 조용히 넘어감 (KeyError 방지)
-            pass
-            
+                print(f" - {col} JSD: {jsd:.4f} (논문 목표: < 0.1)")
+
     # 2. 상관관계 분석 (Correlation)
     print("\n[2] 상관관계 분석 (Pearson Correlation)")
     
-    # [수정] 기초금액_num이 존재하는지 확인 후 분석 수행
-    has_basic_amt = "기초금액_num" in real.columns and "기초금액_num" in synth.columns
-    has_final_amt = "최종낙찰금액_num" in real.columns and "최종낙찰금액_num" in synth.columns
+    # [핵심 수정] 위 전처리 단계에서 '기초금액'을 복원했으므로, 여기서 강제로 존재한다고 가정하고 진행
+    # 단, 여전히 결측치로 인해 데이터가 없을 수 있으므로 dropna 후 확인
     
-    if has_basic_amt and has_final_amt:
-        # 데이터 정렬 및 결측 제거
-        real_corr_df = real[["기초금액_num", "최종낙찰금액_num"]].dropna()
-        synth_corr_df = synth[["기초금액_num", "최종낙찰금액_num"]].dropna()
+    real_corr_df = real[["기초금액", "최종낙찰금액"]].dropna() if "기초금액" in real.columns else pd.DataFrame()
+    synth_corr_df = synth[["기초금액", "최종낙찰금액"]].dropna() if "기초금액" in synth.columns else pd.DataFrame()
+    
+    if len(real_corr_df) > 1 and len(synth_corr_df) > 1:
+        corr_real, _ = pearsonr(real_corr_df["기초금액"], real_corr_df["최종낙찰금액"])
+        corr_synth, _ = pearsonr(synth_corr_df["기초금액"], synth_corr_df["최종낙찰금액"])
+        print(f" - 원본 데이터 상관계수 (기초금액 vs 낙찰금액): {corr_real:.4f}")
+        print(f" - 재현 데이터 상관계수 (기초금액 vs 낙찰금액): {corr_synth:.4f}")
         
-        if len(real_corr_df) > 1 and len(synth_corr_df) > 1:
-            corr_real, _ = pearsonr(real_corr_df["기초금액_num"], real_corr_df["최종낙찰금액_num"])
-            corr_synth, _ = pearsonr(synth_corr_df["기초금액_num"], synth_corr_df["최종낙찰금액_num"])
-            print(f" - 원본 데이터 상관계수 (기초금액 vs 낙찰금액): {corr_real:.4f}")
-            print(f" - 재현 데이터 상관계수 (기초금액 vs 낙찰금액): {corr_synth:.4f}")
-            
-            # (A) Scatter Plot (기초금액 vs 낙찰금액) - 존재할 때만 그림
-            plt.figure(figsize=(12, 5))
-            plt.subplot(1, 2, 1)
-            sns.scatterplot(x=real_corr_df["기초금액_num"], y=real_corr_df["최종낙찰금액_num"], alpha=0.5, color='blue')
-            plt.title(f"원본: 기초 vs 낙찰 (Corr={corr_real:.2f})")
-            
-            plt.subplot(1, 2, 2)
-            sns.scatterplot(x=synth_corr_df["기초금액_num"], y=synth_corr_df["최종낙찰금액_num"], alpha=0.5, color='red')
-            plt.title(f"재현(DP-CTGAN): 기초 vs 낙찰 (Corr={corr_synth:.2f})")
-            
-            plt.tight_layout()
-            plt.savefig("Fig_2-2_Correlation_Scatter.png", dpi=300)
-            print(" - [Graph Saved] Fig_2-2_Correlation_Scatter.png")
+        # (A) Scatter Plot (기초금액 vs 낙찰금액)
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        # 데이터가 너무 많으면 1000개만 샘플링하여 시각화 (속도 및 가독성)
+        if len(real_corr_df) > 1000:
+            sample = real_corr_df.sample(1000)
+            sns.scatterplot(x=sample["기초금액"], y=sample["최종낙찰금액"], alpha=0.5, color='blue')
+        else:
+            sns.scatterplot(x=real_corr_df["기초금액"], y=real_corr_df["최종낙찰금액"], alpha=0.5, color='blue')
+        plt.title(f"원본: 기초 vs 낙찰 (Corr={corr_real:.2f})")
+        
+        plt.subplot(1, 2, 2)
+        if len(synth_corr_df) > 1000:
+            sample = synth_corr_df.sample(1000)
+            sns.scatterplot(x=sample["기초금액"], y=sample["최종낙찰금액"], alpha=0.5, color='red')
+        else:
+            sns.scatterplot(x=synth_corr_df["기초금액"], y=synth_corr_df["최종낙찰금액"], alpha=0.5, color='red')
+        plt.title(f"재현(DP-CTGAN): 기초 vs 낙찰 (Corr={corr_synth:.2f})")
+        
+        plt.tight_layout()
+        plt.savefig("Fig_2-2_Correlation_Scatter.png", dpi=300)
+        print(" - [Graph Saved] Fig_2-2_Correlation_Scatter.png")
     else:
-        logging.warning("[Skip] '기초금액' 또는 '최종낙찰금액' 컬럼이 없어 상관관계 산점도를 그릴 수 없습니다.")
+        logging.warning("[Error] '기초금액' 데이터 복원 실패로 산점도를 그릴 수 없습니다.")
 
     # ---------------------------------------------------------
     # [시각화 1] 롱테일 분포 비교 (최종낙찰금액)
     # ---------------------------------------------------------
-    col = "최종낙찰금액_num"
+    col = "최종낙찰금액"
     if col in real.columns and col in synth.columns:
         plt.figure(figsize=(10, 6))
-        sns.kdeplot(real[col].dropna(), shade=True, label='원본 데이터 (Original)', color='blue')
-        sns.kdeplot(synth[col].dropna(), shade=True, label='재현 데이터 (DP-CTGAN)', color='red', linestyle='--')
-        plt.title(f"도표 1. {col.replace('_num','')} 분포 유사성")
+        # 분포 시각화를 위해 상위 1% 이상치(Outlier) 제외 (그래프가 너무 길어지는 것 방지)
+        vmax = real[col].quantile(0.99)
+        real_plot = real[col][real[col] < vmax]
+        synth_plot = synth[col][synth[col] < vmax]
+        
+        sns.kdeplot(real_plot, shade=True, label='원본 데이터 (Original)', color='blue')
+        sns.kdeplot(synth_plot, shade=True, label='재현 데이터 (DP-CTGAN)', color='red', linestyle='--')
+        plt.title(f"도표 1. 분포 유사성 (JSD={jsd_results.get(col, 0):.3f})")
         plt.xlabel("금액 (단위: 원)")
         plt.ylabel("밀도 (Density)")
         plt.legend()
@@ -265,9 +297,9 @@ def analyze_statistical_similarity(real: pd.DataFrame, synth: pd.DataFrame):
         print(" - [Graph Saved] Fig_2-1_Distribution_Amount.png")
 
     # ---------------------------------------------------------
-    # [시각화 2] 상관관계 히트맵 (Heatmap) - [수정] 존재 컬럼만 선택
+    # [시각화 2] 상관관계 히트맵 (Heatmap)
     # ---------------------------------------------------------
-    target_cols = ["기초금액_num", "최종낙찰금액_num", "낙찰율_num"]
+    target_cols = ["기초금액", "최종낙찰금액", "낙찰율"]
     # 실제 데이터셋에 존재하는 컬럼만 필터링
     available_cols = [c for c in target_cols if c in real.columns and c in synth.columns]
     
@@ -285,7 +317,7 @@ def analyze_statistical_similarity(real: pd.DataFrame, synth: pd.DataFrame):
         plt.savefig("Fig_2-3_Correlation_Heatmap.png", dpi=300)
         print(" - [Graph Saved] Fig_2-3_Correlation_Heatmap.png")
     else:
-        logging.warning("[Skip] 상관관계를 분석할 수치형 컬럼이 부족하여 Heatmap을 건너뜁니다.")
+        logging.warning("[Error] Heatmap 생성 실패: 유효한 수치형 컬럼 부족")
 
     # ---------------------------------------------------------
     # [시각화 3] 범주형 속성 빈도 비교 (기관_상위)
@@ -326,6 +358,7 @@ def main():
         logging.error(f"데이터 로드 실패: {e}")
         return
 
+    # [중요] 전처리 과정에서 '기초금액' 복원 수행됨
     df_prep = preprocess(df_raw)
     
     # 2. 재현 데이터 생성 (DP-CTGAN)
